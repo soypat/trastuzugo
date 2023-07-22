@@ -28,12 +28,14 @@ import (
 //		StaticContent: []byte(""),
 //	}
 
+var topwindow fyne.Window
+
 type usbControl struct {
 	opener cereal.Opener
 }
 
 func main() {
-	a := app.NewWithID("io.fyne.demo")
+	a := app.NewWithID("trastuzu.go")
 	var opener = &usbControl{
 		opener: cereal.Bugst{},
 	}
@@ -41,7 +43,7 @@ func main() {
 	makeTray(a)
 	logLifecycle(a)
 	w := a.NewWindow("Comms - Trastuzugo")
-
+	topwindow = w
 	w.SetMainMenu(makeMenu(a, w))
 	w.SetMaster()
 
@@ -274,12 +276,11 @@ func logLifecycle(a fyne.App) {
 
 func makeTray(a fyne.App) {
 	if desk, ok := a.(desktop.App); ok {
-		h := fyne.NewMenuItem("Hello", func() {})
+		h := fyne.NewMenuItem("Bring to front", func() {})
 		h.Icon = theme.HomeIcon()
-		menu := fyne.NewMenu("Hello World", h)
+		menu := fyne.NewMenu("Tray menu", h)
 		h.Action = func() {
-			log.Println("System tray menu tapped")
-			h.Label = "Welcome"
+			topwindow.RequestFocus()
 			menu.Refresh()
 		}
 		desk.SetSystemTrayMenu(menu)
