@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -93,14 +94,21 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 	stopbitsSelect := widget.NewSelectEntry([]string{"1", "2"})
 	stopbitsSelect.SetText("1")
 	stopbitsSelect.Validator = intValidator
+	paritySelect := widget.NewSelectEntry([]string{"None", "Odd", "Even", "Mark", "Space"})
+	paritySelect.SetText("None")
+	paritySelect.Validator = validateParity
+	databitsSelect := widget.NewSelectEntry([]string{"5", "6", "7", "8"})
+	databitsSelect.SetText("8")
+	databitsSelect.Validator = intValidator
+
 	usbSelector := &widget.Form{
 		SubmitText: "Open port",
 		Items: []*widget.FormItem{
 			{Text: "Device", HintText: "Select a USB device", Widget: usbDevDropdown},
 			{Text: "Baud", Widget: baudSelect},
-			// {Text: "Data Bits", Widget: widget.NewSelectEntry([]string{"5", "6", "7", "8"})},
+			{Text: "Data Bits", Widget: databitsSelect},
 			{Text: "Stop Bits", Widget: stopbitsSelect},
-			// {Text: "Parity", Widget: widget.NewSelectEntry([]string{"None", "Odd", "Even", "Mark", "Space"})},
+			{Text: "Parity", Widget: paritySelect},
 		},
 		OnSubmit: func() {
 			baud, err := strconv.Atoi(baudSelect.Text)
@@ -114,10 +122,20 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 				return
 			}
 			stopbits = stopbits/2 + b2i(stopbits == 2)
+			databits, err := strconv.Atoi(databitsSelect.Text)
+			if err != nil {
+				log.Println("Error parsing databits", err)
+				return
+			}
+			p, err := parseParity(paritySelect.Text)
+			if err != nil {
+				log.Println("Error parsing parity", err)
+				return
+			}
 			mode := cereal.Mode{
 				BaudRate: baud,
-				DataBits: 8,
-				Parity:   cereal.ParityNone,
+				DataBits: databits,
+				Parity:   p,
 				StopBits: cereal.StopBits(stopbits),
 			}
 			dev, _, _ := strings.Cut(usbDevDropdown.Text, " (")
@@ -156,6 +174,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 		duration := widget.NewEntry()
 		duration.SetText("0s")
 		duration.Validator = durationValidator
+		duration.TextStyle.Monospace = true
 		dataentry := widget.NewMultiLineEntry()
 		removeButton := widget.NewButton("Remove", nil)
 		removeButton.OnTapped = func() {
@@ -330,4 +349,28 @@ func durationValidator(s string) error {
 		return fmt.Errorf("duration must be positive")
 	}
 	return err
+}
+
+func validateParity(s string) error {
+	_, err := parseParity(s)
+	return err
+}
+
+func parseParity(s string) (p cereal.Parity, err error) {
+	s = strings.ToLower(s)
+	switch s {
+	case "none":
+		p = cereal.ParityNone
+	case "odd":
+		p = cereal.ParityOdd
+	case "even":
+		p = cereal.ParityEven
+	case "mark":
+		p = cereal.ParityMark
+	case "space":
+		p = cereal.ParitySpace
+	default:
+		return p, errors.New("unknown parity: " + s)
+	}
+	return p, nil
 }
