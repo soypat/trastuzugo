@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -21,6 +25,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/soypat/cereal"
 	"go.bug.st/serial/enumerator"
+	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slog"
 )
 
@@ -100,6 +105,12 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 	databitsSelect := widget.NewSelectEntry([]string{"5", "6", "7", "8"})
 	databitsSelect.SetText("8")
 	databitsSelect.Validator = intValidator
+	outputdir, err := os.UserHomeDir()
+	if err != nil {
+		outputdir = os.TempDir()
+	}
+	logFormattedName := filepath.Join(outputdir, "trastuzugo-"+time.Kitchen+".log")
+	saveToLog := widget.NewCheck("Save output to log: "+logFormattedName, nil)
 
 	usbSelector := &widget.Form{
 		SubmitText: "Open port",
@@ -109,6 +120,7 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 			{Text: "Data Bits", Widget: databitsSelect},
 			{Text: "Stop Bits", Widget: stopbitsSelect},
 			{Text: "Parity", Widget: paritySelect},
+			{Text: "Save to log", Widget: saveToLog},
 		},
 		OnSubmit: func() {
 			baud, err := strconv.Atoi(baudSelect.Text)
@@ -148,7 +160,11 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 				rwc: rwc,
 				log: slog.Default(),
 			}
-			apptabs.Append(makeUSBTab(dev, rwc, apptabs))
+			var logname string
+			if saveToLog.Checked {
+				logname = time.Now().Format("trastuzugo-" + time.Kitchen + ".log")
+			}
+			apptabs.Append(makeUSBTab(dev, rwc, apptabs, logname))
 
 			log.Println("Opened port", usbDevDropdown.Text)
 		},
@@ -161,13 +177,47 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 	return apptabs
 }
 
-func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTabs) *container.TabItem {
-	// var usbBuffer [1024]byte
+func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTabs, logname string) *container.TabItem {
+	ctx, cancel := context.WithCancel(context.Background())
+	if logname != "" {
+		go func() {
+			defer log.Println("stopped logging to", logname)
+			var buf [1024]byte
+			fp, err := os.Create(logname)
+			if err != nil {
+				log.Println("Error creating log file", err)
+				return
+			}
+			for ctx.Err() == nil {
+				n, _ := rwc.Read(buf[:])
+				if n == 0 {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				_, err = fp.Write(buf[:n])
+				if err != nil {
+					log.Println("Error writing to log file", err)
+					return
+				}
+			}
+		}()
+	}
+
 	closeButton := widget.NewButton("Close "+devname, func() {
+		log.Println("close button pressed for " + devname)
+		cancel()
 		rwc.Close()
 		apptabs.Remove(apptabs.Selected())
 	})
 	closeButton.Importance = widget.DangerImportance
+	escapeSelect := widget.NewSelectEntry(maps.Keys(availableEscapes))
+	escapeSelect.SetText("No escaping")
+	escapeSelect.Validator = func(s string) error {
+		if _, ok := availableEscapes[s]; !ok {
+			return errors.New("unknown escape: " + s)
+		}
+		return nil
+	}
 
 	schedules := container.NewGridWithColumns(3)
 	appendSchedule := func() {
@@ -186,20 +236,34 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 		removeButton.Icon = theme.DeleteIcon()
 		removeButton.Importance = widget.DangerImportance
 		dataentry.SetMinRowsVisible(2)
-
 		dataentry.TextStyle.Monospace = true
+		dataentry.Validator = func(s string) error {
+			esc, ok := availableEscapes[escapeSelect.Text]
+			if !ok || esc == nil {
+				return errors.New("choose valid escape")
+			}
+			_, err := esc(s)
+			return err
+		}
 		schedules.Add(duration)
 		schedules.Add(dataentry)
 		schedules.Add(removeButton)
 
 		schedules.Refresh()
 	}
+
 	appendSchedule()
 	scheduleScroll := container.NewVScroll(container.NewVBox(schedules))
 	scheduleScroll.SetMinSize(fyne.NewSize(0, 200))
 	sendButton := widget.NewButton("Send data", nil)
 	onRepeat := widget.NewCheck("Repeat", nil)
+	precedLFwithCR := widget.NewCheck("Precede newlines with CR (\\r)", nil)
 	sendButton.OnTapped = func() {
+		escape, ok := availableEscapes[escapeSelect.Text]
+		if !ok || escape == nil {
+			log.Println("Unknown escape", escapeSelect.Text)
+			return
+		}
 		sendButton.Text = "In schedule call..."
 		sendButton.Disable()
 		go func() {
@@ -207,35 +271,53 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 				sendButton.Text = "Send data"
 				sendButton.Enable()
 			}()
+			repeated := 0
 		REPEAT:
 			objects := append([]fyne.CanvasObject{}, schedules.Objects...)
+			start := time.Now()
 			for i := 0; i < len(objects); i += 3 {
 				duration, _ := time.ParseDuration(objects[i].(*widget.Entry).Text)
 				text := objects[i+1].(*widget.Entry).Text
-				n, err := rwc.Write([]byte(text))
+				escapedText, err := escape(text)
+				if err != nil {
+					log.Println("Error escaping text", err)
+					return
+				}
+				if precedLFwithCR.Checked {
+					escapedText = bytes.ReplaceAll(escapedText, []byte("\n"), []byte("\r\n"))
+				}
+				n, err := rwc.Write(escapedText)
 				if n == 0 && err != nil {
 					log.Println("Error writing to port", err)
 					return
 				}
 				time.Sleep(duration)
 			}
+			repeated++
 			if onRepeat.Checked {
+				if repeated%1000 == 0 && time.Since(start) > time.Millisecond {
+					time.Sleep(time.Millisecond) // Sleep a millisecond to not hog the CPU every 1000 iterations.
+				}
 				goto REPEAT
 			}
 		}()
 	}
+
 	scheduleTitle := container.NewGridWithColumns(3)
 	scheduleTitle.Objects = []fyne.CanvasObject{
 		widget.NewLabel("Duration (hold time)"),
 		widget.NewLabel("Data"),
 		widget.NewLabel(""),
 	}
-	sender := container.NewHBox(sendButton, widget.NewButton("Add schedule", appendSchedule), onRepeat)
+
+	sender := container.NewHBox(sendButton, widget.NewButton("Add schedule", appendSchedule), widget.NewLabel("Escapes:"), escapeSelect)
+	checkboxes := container.NewHBox(onRepeat, precedLFwithCR)
 	return container.NewTabItem(devname, container.NewVBox(
 		closeButton,
 		scheduleTitle,
 		scheduleScroll,
 		sender,
+		checkboxes,
 	))
 }
 
@@ -283,13 +365,6 @@ func logLifecycle(a fyne.App) {
 	a.Lifecycle().SetOnStopped(func() {
 		log.Println("Lifecycle: Stopped")
 		fmt.Println("numgoroutine", runtime.NumGoroutine())
-	})
-	a.Lifecycle().SetOnEnteredForeground(func() {
-		log.Println("Lifecycle: Entered Foreground")
-
-	})
-	a.Lifecycle().SetOnExitedForeground(func() {
-		log.Println("Lifecycle: Exited Foreground")
 	})
 }
 
@@ -372,5 +447,27 @@ func parseParity(s string) (p cereal.Parity, err error) {
 	default:
 		return p, errors.New("unknown parity: " + s)
 	}
+
 	return p, nil
+}
+
+var availableEscapes = map[string]func(string) ([]byte, error){
+	"No escaping": func(s string) ([]byte, error) { return []byte(s), nil },
+	"C-style":     escapesCStyle,
+	"Hex":         escapesHex,
+}
+
+func escapesCStyle(s string) ([]byte, error) {
+	const quotes = `"`
+	s = strings.ReplaceAll(s, quotes, `\"`)
+	s, err := strconv.Unquote(quotes + s + quotes)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
+}
+
+func escapesHex(s string) ([]byte, error) {
+	s = strings.ReplaceAll(s, " ", "")
+	return hex.DecodeString(s)
 }
