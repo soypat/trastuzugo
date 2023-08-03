@@ -194,6 +194,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
+				log.Println("writing", n, "bytes to log file")
 				_, err = fp.Write(buf[:n])
 				if err != nil {
 					log.Println("Error writing to log file", err)
