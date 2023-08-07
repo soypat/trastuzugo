@@ -259,6 +259,8 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 	sendButton := widget.NewButton("Send data", nil)
 	onRepeat := widget.NewCheck("Repeat", nil)
 	precedLFwithCR := widget.NewCheck("Precede newlines with CR (\\r)", nil)
+	appendNewlineIfMissing := widget.NewCheck("Append newline if missing (\\n)", nil)
+	appendNewlineIfMissing.Checked = true
 	sendButton.OnTapped = func() {
 		escape, ok := availableEscapes[escapeSelect.Text]
 		if !ok || escape == nil {
@@ -287,6 +289,12 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 				if precedLFwithCR.Checked {
 					escapedText = bytes.ReplaceAll(escapedText, []byte("\n"), []byte("\r\n"))
 				}
+				if appendNewlineIfMissing.Checked && len(escapedText) > 0 && escapedText[len(escapedText)-1] != '\n' {
+					if precedLFwithCR.Checked {
+						escapedText = append(escapedText, '\r')
+					}
+					escapedText = append(escapedText, '\n')
+				}
 				n, err := rwc.Write(escapedText)
 				if n == 0 && err != nil {
 					log.Println("Error writing to port", err)
@@ -312,7 +320,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 	}
 
 	sender := container.NewHBox(sendButton, widget.NewButton("Add schedule", appendSchedule), widget.NewLabel("Escapes:"), escapeSelect)
-	checkboxes := container.NewHBox(onRepeat, precedLFwithCR)
+	checkboxes := container.NewHBox(onRepeat, precedLFwithCR, appendNewlineIfMissing)
 	return container.NewTabItem(devname, container.NewVBox(
 		closeButton,
 		scheduleTitle,
