@@ -25,6 +25,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/soypat/cereal"
 	"go.bug.st/serial/enumerator"
+	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slog"
 )
@@ -261,46 +262,77 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 	precedLFwithCR := widget.NewCheck("Precede newlines with CR (\\r)", nil)
 	appendNewlineIfMissing := widget.NewCheck("Append newline if missing (\\n)", nil)
 	appendNewlineIfMissing.Checked = true
+
+	cancelPresses := 0
+	cancelSendButton := widget.NewButton("Cancel send", func() {
+		cancelPresses++
+	})
+	cancelSendButton.Hidden = true
+	cancelSendButton.Icon = theme.CancelIcon()
+
+	sendButton.Icon = theme.MailSendIcon()
 	sendButton.OnTapped = func() {
 		escape, ok := availableEscapes[escapeSelect.Text]
 		if !ok || escape == nil {
 			log.Println("Unknown escape", escapeSelect.Text)
 			return
 		}
-		sendButton.Text = "In schedule call..."
+		sendButton.Text = "Sending..."
 		sendButton.Disable()
+		cancelSendButton.Hidden = false
+		cancelSendButton.Refresh()
+		cancelsOnSend := cancelPresses // We track cancels to see if user pressed cancel button.
+		type action struct {
+			D           time.Duration
+			DataEscaped []byte
+		}
+		var actions []action
+		for i := 0; i < len(schedules.Objects); i += 3 {
+			duration, err1 := time.ParseDuration(schedules.Objects[i].(*widget.Entry).Text)
+			text := schedules.Objects[i+1].(*widget.Entry).Text
+			escapedText, err2 := escape(text)
+			if err1 != nil || err2 != nil {
+				return // Error processing received values.
+			}
+			if precedLFwithCR.Checked {
+				escapedText = bytes.ReplaceAll(escapedText, []byte("\n"), []byte("\r\n"))
+			}
+			if appendNewlineIfMissing.Checked && len(escapedText) > 0 && escapedText[len(escapedText)-1] != '\n' {
+				if precedLFwithCR.Checked {
+					escapedText = append(escapedText, '\r')
+				}
+				escapedText = append(escapedText, '\n')
+			}
+			actions = append(actions, action{D: duration, DataEscaped: escapedText})
+		}
 		go func() {
 			defer func() {
 				sendButton.Text = "Send data"
 				sendButton.Enable()
+				cancelSendButton.Hidden = true
+				cancelSendButton.Refresh()
 			}()
 			repeated := 0
 		REPEAT:
-			objects := append([]fyne.CanvasObject{}, schedules.Objects...)
 			start := time.Now()
-			for i := 0; i < len(objects); i += 3 {
-				duration, _ := time.ParseDuration(objects[i].(*widget.Entry).Text)
-				text := objects[i+1].(*widget.Entry).Text
-				escapedText, err := escape(text)
-				if err != nil {
-					log.Println("Error escaping text", err)
-					return
-				}
-				if precedLFwithCR.Checked {
-					escapedText = bytes.ReplaceAll(escapedText, []byte("\n"), []byte("\r\n"))
-				}
-				if appendNewlineIfMissing.Checked && len(escapedText) > 0 && escapedText[len(escapedText)-1] != '\n' {
-					if precedLFwithCR.Checked {
-						escapedText = append(escapedText, '\r')
-					}
-					escapedText = append(escapedText, '\n')
-				}
-				n, err := rwc.Write(escapedText)
+			for _, action := range actions {
+				deadline := time.Now().Add(action.D)
+				n, err := rwc.Write(action.DataEscaped)
 				if n == 0 && err != nil {
 					log.Println("Error writing to port", err)
 					return
 				}
-				time.Sleep(duration)
+
+				for {
+					leftForDeadline := time.Until(deadline)
+					if cancelsOnSend != cancelPresses {
+						return // user pressed cancel button.
+					} else if leftForDeadline > 0 {
+						time.Sleep(min(leftForDeadline, 500*time.Millisecond))
+					} else {
+						break // Done waiting.
+					}
+				}
 			}
 			repeated++
 			if onRepeat.Checked {
@@ -318,8 +350,10 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 		widget.NewLabel("Data"),
 		widget.NewLabel(""),
 	}
+	appendScheduleButton := widget.NewButton("Add schedule", appendSchedule)
+	appendScheduleButton.Icon = theme.ContentAddIcon()
 
-	sender := container.NewHBox(sendButton, widget.NewButton("Add schedule", appendSchedule), widget.NewLabel("Escapes:"), escapeSelect)
+	sender := container.NewHBox(sendButton, appendScheduleButton, widget.NewLabel("Escapes:"), escapeSelect, cancelSendButton)
 	checkboxes := container.NewHBox(onRepeat, precedLFwithCR, appendNewlineIfMissing)
 	return container.NewTabItem(devname, container.NewVBox(
 		closeButton,
@@ -464,6 +498,7 @@ var availableEscapes = map[string]func(string) ([]byte, error){
 	"No escaping": func(s string) ([]byte, error) { return []byte(s), nil },
 	"C-style":     escapesCStyle,
 	"Hex":         escapesHex,
+	"Binary":      escapesBinary,
 }
 
 func escapesCStyle(s string) ([]byte, error) {
@@ -476,7 +511,44 @@ func escapesCStyle(s string) ([]byte, error) {
 	return []byte(s), nil
 }
 
+var whitespaceReplacer = strings.NewReplacer(
+	" ", "",
+	"\n", "",
+	"\r", "",
+	"\t", "",
+)
+
 func escapesHex(s string) ([]byte, error) {
-	s = strings.ReplaceAll(s, " ", "")
+	s = whitespaceReplacer.Replace(s)
 	return hex.DecodeString(s)
+}
+
+func escapesBinary(s string) ([]byte, error) {
+	s = whitespaceReplacer.Replace(s)
+	if len(s)%8 != 0 {
+		return nil, errors.New("require parseable input length to be divisible by 8")
+	}
+	msg := make([]byte, len(s)/8)
+	for byteIdx := 0; byteIdx < len(msg); byteIdx++ {
+		var badChar bool
+		var currentByte byte
+		offset := byteIdx * 8
+		for bitIdx := 7; bitIdx >= 0; bitIdx-- {
+			c := s[offset+7-bitIdx] // MSB go first.
+			badChar = badChar || (c != '0' && c != '1')
+			currentByte |= ((c - '0') & 1) << bitIdx
+		}
+		if badChar {
+			return nil, errors.New("got bad character escaping binary. Expected 1's and 0's")
+		}
+		msg[byteIdx] = currentByte
+	}
+	return msg, nil
+}
+
+func min[T constraints.Ordered](a, b T) T {
+	if a < b {
+		return a
+	}
+	return b
 }
