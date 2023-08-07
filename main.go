@@ -283,7 +283,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 		cancelSendButton.Refresh()
 		cancelsOnSend := cancelPresses // We track cancels to see if user pressed cancel button.
 		type action struct {
-			D           time.Duration
+			Hold        time.Duration
 			DataEscaped []byte
 		}
 		var actions []action
@@ -303,7 +303,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 				}
 				escapedText = append(escapedText, '\n')
 			}
-			actions = append(actions, action{D: duration, DataEscaped: escapedText})
+			actions = append(actions, action{Hold: duration, DataEscaped: escapedText})
 		}
 		go func() {
 			defer func() {
@@ -316,7 +316,7 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 		REPEAT:
 			start := time.Now()
 			for _, action := range actions {
-				deadline := time.Now().Add(action.D)
+				deadline := time.Now().Add(action.Hold)
 				n, err := rwc.Write(action.DataEscaped)
 				if n == 0 && err != nil {
 					log.Println("Error writing to port", err)
