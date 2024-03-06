@@ -62,6 +62,20 @@ func main() {
 	w.ShowAndRun()
 }
 
+func makeLogname(deviceName string) string {
+	outputdir, err := os.UserHomeDir()
+	if err != nil {
+		outputdir = os.TempDir()
+	}
+	_, dev := filepath.Split(deviceName)
+	if dev == "" {
+		dev = "trastuzugo"
+	}
+	now := time.Now()
+	logname := filepath.Join(outputdir, dev+now.Format("-01-02T15:04:05.log"))
+	return logname
+}
+
 func makeusblogger(opener *usbControl) fyne.CanvasObject {
 	apptabs := container.NewAppTabs()
 	usbDevDropdown := widget.NewSelectEntry(nil)
@@ -106,12 +120,9 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 	databitsSelect := widget.NewSelectEntry([]string{"5", "6", "7", "8"})
 	databitsSelect.SetText("8")
 	databitsSelect.Validator = intValidator
-	outputdir, err := os.UserHomeDir()
-	if err != nil {
-		outputdir = os.TempDir()
-	}
-	logFormattedName := filepath.Join(outputdir, "trastuzugo-"+time.Kitchen+".log")
-	saveToLog := widget.NewCheck("Save output to log: "+logFormattedName, nil)
+	logname := makeLogname(usbDevDropdown.SelectedText())
+
+	saveToLog := widget.NewCheck("Save output to log: "+logname, nil)
 
 	usbSelector := &widget.Form{
 		SubmitText: "Open port",
@@ -151,20 +162,18 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 				Parity:   p,
 				StopBits: cereal.StopBits(stopbits),
 			}
-			dev, _, _ := strings.Cut(usbDevDropdown.Text, " (")
+			deviceName := usbDevDropdown.Text
+			dev, _, _ := strings.Cut(deviceName, " (")
 			rwc, err := opener.opener.OpenPort(dev, mode)
 			if err != nil {
-				log.Println("Error opening port", err)
+				log.Println("Error opening port "+deviceName, err)
 				return
 			}
 			rwc = &readWriteLogger{
 				rwc: rwc,
 				log: slog.Default(),
 			}
-			var logname string
-			if saveToLog.Checked {
-				logname = time.Now().Format("trastuzugo-" + time.Kitchen + ".log")
-			}
+			logname := makeLogname(deviceName)
 			apptabs.Append(makeUSBTab(dev, rwc, apptabs, logname))
 
 			log.Println("Opened port", usbDevDropdown.Text)
@@ -180,6 +189,7 @@ func makeusblogger(opener *usbControl) fyne.CanvasObject {
 
 func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTabs, logname string) *container.TabItem {
 	ctx, cancel := context.WithCancel(context.Background())
+	var sendCallback func([]byte)
 	if logname != "" {
 		go func() {
 			defer log.Println("stopped logging to", logname)
@@ -189,18 +199,19 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 				log.Println("Error creating log file", err)
 				return
 			}
+			logger := slog.New(slog.NewTextHandler(fp, &slog.HandlerOptions{
+				Level: slog.LevelInfo,
+			}))
+			sendCallback = func(b []byte) {
+				logger.LogAttrs(context.Background(), slog.LevelInfo, "send", slog.String("dev", devname), slog.String("data", string(b)))
+			}
 			for ctx.Err() == nil {
 				n, _ := rwc.Read(buf[:])
 				if n == 0 {
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
-				log.Println("writing", n, "bytes to log file")
-				_, err = fp.Write(buf[:n])
-				if err != nil {
-					log.Println("Error writing to log file", err)
-					return
-				}
+				logger.LogAttrs(context.Background(), slog.LevelInfo, "recv", slog.String("dev", devname), slog.String("data", string(buf[:n])))
 			}
 		}()
 	}
@@ -318,6 +329,9 @@ func makeUSBTab(devname string, rwc io.ReadWriteCloser, apptabs *container.AppTa
 			for _, action := range actions {
 				deadline := time.Now().Add(action.Hold)
 				n, err := rwc.Write(action.DataEscaped)
+				if sendCallback != nil {
+					sendCallback(action.DataEscaped)
+				}
 				if n == 0 && err != nil {
 					log.Println("Error writing to port", err)
 					return
